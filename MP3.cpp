@@ -1,16 +1,25 @@
 #include <MP3.h>
 
 int MP3::readBytesFromStream() {
-    memmove(_readBuf, _readPtr, _bytesLeft);
-    uint32_t nRead = _source->readBytes(_readBuf + _bytesLeft, READBUF_SIZE - _bytesLeft);
-    memset(_readBuf + _bytesLeft + nRead, 0, READBUF_SIZE - _bytesLeft - nRead);
-    _bytesLeft += nRead;
+    // Step one - pull down the remaining part of the buffer to the start of memory
+    if (_bytesLeft > 0) {
+        memmove(_readBuf, _readPtr, _bytesLeft);
+    }
+    uint32_t nr;
+    int rv;
+
+    // Step two - fill the latter part of the buffer (now empty) with more data.
+    if ((rv = _file->fsread(_readBuf + _bytesLeft, READBUF_SIZE - _bytesLeft, &nr, (READBUF_SIZE - _bytesLeft) / 512 + 1)) != FR_OK) {
+        return -1;
+    }
+//    memset(_readBuf + _bytesLeft + nr, 0, READBUF_SIZE - _bytesLeft - nr);
+    _bytesLeft += nr;
     _readPtr = _readBuf;
-    return nRead;
+    return nr;
 }
 
-MP3::MP3(Stream &str) {
-    _source = &str;
+MP3::MP3(DFILE *file) {
+    _file = file; 
     _mp3DecInfo.FrameHeaderPS =     (void *)&_frameHeader;
     _mp3DecInfo.SideInfoPS =        (void *)&_sideInfo;
     _mp3DecInfo.ScaleFactorInfoPS = (void *)&_scaleFactorInfo;
@@ -38,26 +47,41 @@ int MP3::decodeFrameInfo(uint8_t *ptr) {
 
 int MP3::decodeStream(uint8_t **ptr, int *len, int16_t *outBuf) {
     return MP3Decode(&_mp3DecInfo, ptr, len, outBuf, 0);
-
 }
 
-int MP3::begin() {
+void MP3::initStream() {
+    _file->fslseek(0);
     int offset = -1;
-    while (offset < 0) {
-        _bytesLeft = _source->readBytes(_readBuf, READBUF_SIZE);
-        if (_bytesLeft == 0) {
-            return -1;
-        }
-        _readPtr = _readBuf;
-        offset = MP3FindSyncWord(_readPtr, _bytesLeft); 
-    }
-    _readPtr += offset;
-    _bytesLeft -= offset;
-    int err = decodeFrameInfo(_readPtr);
-    Serial.printf("Channels: %d\r\n", _frameInfo.nChans);
-    Serial.printf("Sample Rate: %d\r\n", _frameInfo.samprate);
+    _bytesLeft = 0;
+    bool found = false; 
+    while (!found) {
+        while (offset < 0) {
+            uint32_t nr;
 
-    readBytesFromStream();
+            nr = readBytesFromStream();
+            if (nr < 0) {
+                return;
+            }
+
+            offset = MP3FindSyncWord(_readPtr, nr); 
+
+            if (offset < 0) { // Discard the buffer.
+                _bytesLeft = 0;
+            } else {
+                _readPtr = _readBuf + offset;
+                _bytesLeft -= offset;
+            }
+        }
+        offset = -1;
+
+        // We have a sync word. Let's top up the buffer.
+        readBytesFromStream();
+        // This should have shifted the sync word to the start of the buffer.
+        int err = decodeFrameInfo(_readPtr);
+        if (err >= 0) {
+            found = true;
+        }
+    }
 }
 
 int MP3::decodeNewChunk() {
@@ -68,17 +92,14 @@ int MP3::decodeNewChunk() {
             case 0:
             case -2: // Read more.
                 if (readBytesFromStream() <= 0) {
-Serial.println("EOF");
                     return -2;
                 }
                 break;
             default:
-Serial.print("Error: ");
-Serial.println(err);
                 return err;
         }
     } while (err != 0);
-    _numSamples = 1152;
+    _numSamples = _mp3DecInfo.nGrans * _mp3DecInfo.nGranSamps * _mp3DecInfo.nChans;
     _outPos = 0;
     return err;
 }
@@ -92,4 +113,23 @@ int MP3::read() {
         }
     }
     return _outBuf[_outPos++];
+}
+
+uint32_t MP3::getNextSampleBlock(int16_t *samples, uint32_t len) {
+    for (int i = 0; i < len; i++) {
+        int v = read();
+        if (v == -70000) {
+            return i;
+        }
+        samples[i] = v;
+    }
+    return len;
+}
+
+uint32_t MP3::getFrameLength() {
+    return _frameInfo.outputSamps;
+}
+
+uint32_t MP3::getChannels() {
+    return _frameInfo.nChans;
 }
